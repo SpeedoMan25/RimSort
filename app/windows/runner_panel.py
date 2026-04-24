@@ -77,6 +77,12 @@ class RunnerPanel(QWidget):
         self.login_error = False
         self.redownloading = False
 
+        # Batch-download state (populated by SteamcmdInterface.download_mods)
+        self._pending_steamcmd_batches: list[list[str]] = []
+        self._steamcmd_executable: str = ""
+        self._steamcmd_wrapper: Optional[object] = None  # SteamcmdInterface
+        self._steamcmd_batch_index: int = 1  # 1-based; first batch already sent
+
         # Set up UI components
         self._setup_text_display()
         self._setup_buttons()
@@ -478,6 +484,10 @@ class RunnerPanel(QWidget):
     def finished(self) -> None:
         """
         Handle process completion, including success/failure reporting and cleanup.
+
+        If the completed process was a SteamCMD batch download and additional
+        batches are still pending, the next batch is started automatically
+        instead of showing the final completion dialog.
         """
         # Skip detailed output in dry run mode
         if not self.todds_dry_run_support:
@@ -488,6 +498,12 @@ class RunnerPanel(QWidget):
 
             # Handle process-specific completion tasks
             if "SteamCMD" in self.windowTitle():
+                # If more batches remain, start the next one instead of
+                # finalising.  _handle_steamcmd_completion() is only called
+                # once every batch has been processed.
+                if self._pending_steamcmd_batches and not self.redownloading:
+                    self._start_next_steamcmd_batch()
+                    return
                 self._handle_steamcmd_completion()
             elif "todds" in self.windowTitle():
                 self._handle_todds_completion()
@@ -496,6 +512,36 @@ class RunnerPanel(QWidget):
         if not self.redownloading:
             self.process.terminate()
             self.process_complete()
+
+    def _start_next_steamcmd_batch(self) -> None:
+        """Pop the next pending batch and start a new SteamCMD process for it."""
+        next_batch = self._pending_steamcmd_batches.pop(0)
+        self._steamcmd_batch_index += 1
+        total_batches = self._steamcmd_batch_index + len(self._pending_steamcmd_batches)
+
+        self.message(
+            f"\nBatch {self._steamcmd_batch_index}/{total_batches}: "
+            f"downloading {len(next_batch)} mod(s)..."
+        )
+
+        # _steamcmd_wrapper is the SteamcmdInterface instance set by download_mods()
+        wrapper = self._steamcmd_wrapper
+        if wrapper is None:
+            logger.error("_start_next_steamcmd_batch: no wrapper reference stored on runner")
+            return
+
+        script_path = wrapper._build_download_script(next_batch)  # type: ignore[union-attr]
+        self.message(f"Compiled & using script: {script_path}")
+
+        # Re-wire the finished signal before starting the new process.
+        self.process = QProcess(self)
+        self.process.setProgram(self._steamcmd_executable)
+        self.process.setArguments([f'+runscript "{script_path}"'])
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.process.readyReadStandardError.connect(self.handle_output)
+        self.process.readyReadStandardOutput.connect(self.handle_output)
+        self.process.finished.connect(self.finished)
+        self.process.start()
 
     def _handle_steamcmd_completion(self) -> None:
         """Handle SteamCMD-specific completion tasks."""
